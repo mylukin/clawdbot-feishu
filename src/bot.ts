@@ -237,7 +237,7 @@ export async function handleFeishuMessage(params: {
   const ctx = parseFeishuMessageEvent(event, botOpenId);
   const isGroup = ctx.chatType === "group";
 
-  log(`feishu: received message from ${ctx.senderOpenId} in ${ctx.chatId} (${ctx.chatType})`);
+  log(`feishu: received message from ${ctx.senderOpenId} in ${ctx.chatId} (${ctx.chatType}) contentType=${ctx.contentType}`);
 
   const historyLimit = Math.max(
     0,
@@ -358,38 +358,60 @@ export async function handleFeishuMessage(params: {
     const envelopeOptions = core.channel.reply.resolveEnvelopeFormatOptions(cfg);
 
     // Handle image messages - download and prepare for agent
+    // Feishu sends images in two formats:
+    // 1. Pure image: contentType="image", content={"image_key":"..."}
+    // 2. Rich text with image: contentType="post", content={"content":[[{"tag":"img","image_key":"..."}]]}
     let downloadedMedia: DownloadedMedia | undefined;
     let mediaPlaceholder = "";
-    if (ctx.contentType === "image") {
-      try {
-        log(`feishu: detected image message, attempting to download`);
+    let extractedImageKey: string | undefined;
+    let extractedText = "";
 
-        // Parse the image_key from image message content
-        const imageContent = JSON.parse(event.message.content);
-        const imageKey = imageContent.image_key;
+    try {
+      const parsedContent = JSON.parse(event.message.content);
 
-        if (imageKey) {
-          log(`feishu: downloading image: ${imageKey}`);
-          downloadedMedia = await downloadFeishuImage({
-            cfg,
-            messageId: ctx.messageId,
-            imageKey,
-          });
-          mediaPlaceholder = "<media:image>";
-          log(`feishu: image downloaded to ${downloadedMedia.path}`);
-        } else {
-          log(`feishu: no image_key found in image message`);
+      if (ctx.contentType === "image") {
+        // Pure image message
+        extractedImageKey = parsedContent.image_key;
+      } else if (ctx.contentType === "post") {
+        // Rich text message - look for img tags
+        const contentArray = parsedContent.content;
+        if (Array.isArray(contentArray)) {
+          for (const row of contentArray) {
+            if (Array.isArray(row)) {
+              for (const item of row) {
+                if (item.tag === "img" && item.image_key) {
+                  extractedImageKey = item.image_key;
+                } else if (item.tag === "text" && item.text) {
+                  extractedText += item.text;
+                }
+              }
+            }
+          }
         }
-      } catch (err) {
-        log(`feishu: failed to download image: ${String(err)}`);
-        // Continue without image
       }
+
+      if (extractedImageKey) {
+        log(`feishu: detected image message, attempting to download: ${extractedImageKey}`);
+        downloadedMedia = await downloadFeishuImage({
+          cfg,
+          messageId: ctx.messageId,
+          imageKey: extractedImageKey,
+        });
+        mediaPlaceholder = "<media:image>";
+        log(`feishu: image downloaded to ${downloadedMedia.path}`);
+      }
+    } catch (err) {
+      log(`feishu: failed to process/download image: ${String(err)}`);
+      // Continue without image
     }
 
+    // Use extracted text if available (from post messages)
+    const textContent = extractedText.trim() || ctx.content;
+
     // Build message body with quoted content if available
-    let messageBody = ctx.content || mediaPlaceholder;
+    let messageBody = textContent || mediaPlaceholder;
     if (quotedContent) {
-      messageBody = `[Replying to: "${quotedContent}"]\n\n${ctx.content}`;
+      messageBody = `[Replying to: "${quotedContent}"]\n\n${textContent || mediaPlaceholder}`;
     }
 
     // Check if user is requesting chat history
@@ -449,8 +471,8 @@ export async function handleFeishuMessage(params: {
 
     const ctxPayload = core.channel.reply.finalizeInboundContext({
       Body: combinedBody,
-      RawBody: ctx.content || mediaPlaceholder,
-      CommandBody: ctx.content || mediaPlaceholder,
+      RawBody: textContent || mediaPlaceholder,
+      CommandBody: textContent || mediaPlaceholder,
       From: feishuFrom,
       To: feishuTo,
       SessionKey: route.sessionKey,
