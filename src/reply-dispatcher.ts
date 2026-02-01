@@ -168,15 +168,7 @@ class FeishuStream {
 
   private isContinuation(prev: string, next: string): boolean {
     if (!prev) return true;
-    if (next.startsWith(prev)) return true;
-    if (prev.startsWith(next)) return true;
-    if (prev.length >= 16) {
-      if (prev.length > next.length * 0.3) {
-        const idx = next.indexOf(prev);
-        if (idx >= 0 && idx <= 32) return true;
-      }
-    }
-    return false;
+    return next.startsWith(prev);
   }
 
   private computeFinalizedLength(segments: string[]): number {

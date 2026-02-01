@@ -19,23 +19,6 @@ import { createFeishuReplyDispatcher } from "./reply-dispatcher.js";
 import { getMessageFeishu, listMessagesFeishu, type FeishuHistoryMessage } from "./send.js";
 import { downloadImageFeishu, downloadMessageResourceFeishu } from "./media.js";
 
-// --- Helper: Generate Feishu image URL for model access ---
-// Feishu images can be accessed via URL: https://{domain}/im/v1/images/{imageKey}
-// This allows downstream models to fetch and process the image content.
-function getFeishuImageUrl(params: {
-  imageKey: string;
-  domain?: string;
-  tenantKey?: string;
-}): string {
-  const { imageKey, domain = "feishu", tenantKey } = params;
-  const baseUrl = domain === "lark" ? "https://lark.im" : "https://feishu.cn";
-  const url = new URL(`${baseUrl}/im/v1/images/${imageKey}`);
-  if (tenantKey) {
-    url.searchParams.set("tenant_key", tenantKey);
-  }
-  return url.toString();
-}
-
 // --- Sender name resolution (so the agent can distinguish who is speaking in group chats) ---
 // Cache display names by open_id to avoid an API call on every message.
 const SENDER_NAME_TTL_MS = 10 * 60 * 1000;
@@ -132,11 +115,25 @@ function parseMessageContent(content: string, messageType: string): string {
     }
     if (messageType === "post") {
       // Extract text content from rich text post
-      const { textContent } = parsePostContent(content);
+      const { textContent, imageKeys } = parsePostContent(content);
+      const trimmed = textContent?.trim() || "";
+      const hasText = trimmed && trimmed !== "[富文本消息]";
+      if (!hasText && imageKeys.length > 0) {
+        return `<media:image>${imageKeys.length > 1 ? ` (${imageKeys.length} images)` : ""}`;
+      }
       return textContent;
+    }
+    if (["image", "file", "audio", "video", "sticker"].includes(messageType)) {
+      return inferPlaceholder(messageType);
     }
     return content;
   } catch {
+    if (messageType === "post") {
+      return "[富文本消息]";
+    }
+    if (["image", "file", "audio", "video", "sticker"].includes(messageType)) {
+      return inferPlaceholder(messageType);
+    }
     return content;
   }
 }
@@ -278,10 +275,6 @@ async function resolveFeishuMediaList(params: {
   const out: FeishuMediaInfo[] = [];
   const core = getFeishuRuntime();
 
-  // Get Feishu config for domain
-  const feishuCfg = cfg.channels?.feishu as FeishuConfig | undefined;
-  const domain = feishuCfg?.domain ?? "feishu";
-
   // Handle post (rich text) messages with embedded images
   if (messageType === "post") {
     const { imageKeys } = parsePostContent(content);
@@ -313,17 +306,13 @@ async function resolveFeishuMediaList(params: {
           maxBytes,
         );
 
-        // Generate accessible URL for downstream models
-        const imageUrl = getFeishuImageUrl({ imageKey, domain });
-
         out.push({
           path: saved.path,
-          url: imageUrl,
           contentType: saved.contentType,
           placeholder: "<media:image>",
         });
 
-        log?.(`feishu: downloaded embedded image ${imageKey}, saved to ${saved.path}, URL: ${imageUrl}`);
+        log?.(`feishu: downloaded embedded image ${imageKey}, saved to ${saved.path}`);
       } catch (err) {
         log?.(`feishu: failed to download embedded image ${imageKey}: ${String(err)}`);
       }
@@ -375,20 +364,13 @@ async function resolveFeishuMediaList(params: {
       fileName,
     );
 
-    // Generate accessible URL for downstream models (only for images)
-    let imageUrl: string | undefined;
-    if (messageType === "image" && mediaKeys.imageKey) {
-      imageUrl = getFeishuImageUrl({ imageKey: mediaKeys.imageKey, domain });
-    }
-
     out.push({
       path: saved.path,
-      url: imageUrl,
       contentType: saved.contentType,
       placeholder: inferPlaceholder(messageType),
     });
 
-    log?.(`feishu: downloaded ${messageType} media, saved to ${saved.path}${imageUrl ? `, URL: ${imageUrl}` : ""}`);
+    log?.(`feishu: downloaded ${messageType} media, saved to ${saved.path}`);
   } catch (err) {
     log?.(`feishu: failed to download ${messageType} media: ${String(err)}`);
   }
@@ -399,9 +381,6 @@ async function resolveFeishuMediaList(params: {
 /**
  * Build media payload for inbound context.
  * Similar to Discord's buildDiscordMediaPayload().
- *
- * IMPORTANT: We prioritize URL over local path so downstream models (like minimax)
- * can access the image content. Local paths are only kept for debugging/cleanup.
  */
 function buildFeishuMediaPayload(
   mediaList: FeishuMediaInfo[],
@@ -415,14 +394,13 @@ function buildFeishuMediaPayload(
 } {
   const first = mediaList[0];
   const mediaPaths = mediaList.map((media) => media.path);
-  const mediaUrls = mediaList.map((media) => media.url ?? media.path);
   const mediaTypes = mediaList.map((media) => media.contentType).filter(Boolean) as string[];
   return {
     MediaPath: first?.path,
     MediaType: first?.contentType,
-    MediaUrl: first?.url ?? first?.path,  // Prioritize URL for model access
+    MediaUrl: first?.path,
     MediaPaths: mediaPaths.length > 0 ? mediaPaths : undefined,
-    MediaUrls: mediaUrls.length > 0 ? mediaUrls : undefined,  // Prioritize URLs
+    MediaUrls: mediaPaths.length > 0 ? mediaPaths : undefined,
     MediaTypes: mediaTypes.length > 0 ? mediaTypes : undefined,
   };
 }
