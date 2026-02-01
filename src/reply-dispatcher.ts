@@ -30,15 +30,18 @@ function shouldUseCard(text: string): boolean {
 // Feishu rate limits are strict (5 QPS), so we throttle updates.
 // We target ~2-3 updates per second to be safe and smooth.
 const STREAM_UPDATE_INTERVAL_MS = 400;
+const DELIVERED_KEYS_MAX = 100;
 
 class FeishuStream {
-  private messageId: string | null = null;
+  private messageIds: string[] = [];
+  private segments: string[] = [];
+  private finalizedLength = 0;
   private lastContent = "";
   private lastUpdateTime = 0;
   private pendingUpdate: NodeJS.Timeout | null = null;
   private pendingContent: string | null = null;
   private isFinalized = false;
-  private initializationPromise: Promise<void> | null = null;
+  private updateChain: Promise<void> = Promise.resolve();
 
   constructor(
     private ctx: {
@@ -47,140 +50,336 @@ class FeishuStream {
       replyToMessageId?: string;
       runtime: RuntimeEnv;
     },
+    private opts: {
+      textChunkLimit: number;
+      chunkMode: "length" | "newline";
+    },
   ) {}
 
   async update(content: string, isFinal = false): Promise<void> {
     if (this.isFinalized) return;
     if (content === this.lastContent && !isFinal) return;
 
-    // If we haven't sent the first message yet, send it immediately
-    if (!this.messageId) {
-      // If we are already creating the message, wait for it
-      if (this.initializationPromise) {
-        await this.initializationPromise;
-        // After waiting, if we have a messageId, proceed to normal update flow
-        if (!this.messageId) {
-          // Initialization failed
-          return;
-        }
-      } else {
-        // Start initialization
-        this.ctx.runtime.log?.(`feishu stream: initializing card with "${content.slice(0, 20)}..."`);
-
-        this.initializationPromise = (async () => {
-          try {
-            const card = createSimpleTextCard(content, true /* streaming */);
-
-            const result = await sendCardFeishu({
-              cfg: this.ctx.cfg,
-              to: this.ctx.chatId,
-              card,
-              replyToMessageId: this.ctx.replyToMessageId,
-            });
-            this.messageId = result.messageId;
-            this.lastContent = content;
-            this.lastUpdateTime = Date.now();
-            this.ctx.runtime.log?.(`feishu stream: initialized card messageId=${this.messageId}`);
-          } catch (err) {
-            this.ctx.runtime.error?.(`feishu stream card create failed: ${String(err)}`);
-          } finally {
-            this.initializationPromise = null;
-          }
-        })();
-
-        await this.initializationPromise;
-        return;
-      }
+    if (isFinal) {
+      this.clearPending();
+      await this.enqueueUpdate(() => this.applyUpdate(content, true));
+      return;
     }
 
-    // Schedule or execute update
+    if (!this.messageIds.length) {
+      await this.enqueueUpdate(() => this.applyUpdate(content, false));
+      return;
+    }
+
     const now = Date.now();
     const timeSinceLast = now - this.lastUpdateTime;
 
-    if (isFinal || timeSinceLast >= STREAM_UPDATE_INTERVAL_MS) {
-      // Clear any pending update since we're updating now
-      if (this.pendingUpdate) {
-        clearTimeout(this.pendingUpdate);
-        this.pendingUpdate = null;
-      }
-      this.pendingContent = null;
-      await this.performUpdate(content);
-    } else if (!this.pendingUpdate) {
-      // Schedule a throttled update
-      this.pendingContent = content;
+    if (timeSinceLast >= STREAM_UPDATE_INTERVAL_MS) {
+      this.clearPending();
+      await this.enqueueUpdate(() => this.applyUpdate(content, false));
+      return;
+    }
+
+    this.pendingContent = content;
+    if (!this.pendingUpdate) {
       this.pendingUpdate = setTimeout(() => {
         this.pendingUpdate = null;
         const nextContent = this.pendingContent;
         this.pendingContent = null;
         if (!nextContent || nextContent === this.lastContent) return;
-        this.performUpdate(nextContent).catch(() => {});
+        void this.enqueueUpdate(() => this.applyUpdate(nextContent, false));
       }, STREAM_UPDATE_INTERVAL_MS - timeSinceLast);
-    } else {
-      // Update pending content to the latest value
-      this.pendingContent = content;
     }
   }
 
-  private async performUpdate(content: string) {
-    if (!this.messageId || this.isFinalized) return;
-    try {
-      const card = createSimpleTextCard(content, true);
+  async finalize(content: string): Promise<void> {
+    if (this.isFinalized) return;
 
+    this.clearPending();
+
+    const finalContent = content || this.pendingContent || this.lastContent || "";
+    this.pendingContent = null;
+
+    if (!finalContent) return;
+    await this.enqueueUpdate(() => this.applyUpdate(finalContent, true));
+  }
+
+  getMessageId(): string | null {
+    if (!this.messageIds.length) return null;
+    return this.messageIds[this.messageIds.length - 1] ?? null;
+  }
+
+  private clearPending() {
+    if (this.pendingUpdate) {
+      clearTimeout(this.pendingUpdate);
+      this.pendingUpdate = null;
+    }
+    this.pendingContent = null;
+  }
+
+  private enqueueUpdate(task: () => Promise<void>): Promise<void> {
+    this.updateChain = this.updateChain
+      .then(task)
+      .catch((err) => {
+        this.ctx.runtime.log?.(`feishu stream update failed: ${String(err)}`);
+      });
+    return this.updateChain;
+  }
+
+  private async applyUpdate(content: string, isFinal: boolean): Promise<void> {
+    if (this.isFinalized) return;
+    if (!content && !isFinal) return;
+
+    if (this.segments.length && !this.isContinuation(this.lastContent, content)) {
+      await this.finalizeActiveMessage();
+      this.resetState();
+    }
+
+    let nextSegments = this.buildSegments(content);
+    if (nextSegments === null) {
+      await this.finalizeActiveMessage();
+      this.resetState();
+      nextSegments = this.buildSegments(content);
+      if (nextSegments === null) {
+        this.ctx.runtime.error?.("feishu stream: unexpected null segments after reset");
+        return;
+      }
+    }
+    if (!nextSegments.length) return;
+
+    await this.syncSegments(nextSegments, isFinal);
+    this.segments = nextSegments;
+    this.finalizedLength = this.computeFinalizedLength(nextSegments);
+    this.lastContent = content;
+
+    if (isFinal) {
+      this.isFinalized = true;
+      this.ctx.runtime.log?.(`feishu stream: finalized with ${content.length} chars`);
+    }
+  }
+
+  private resetState() {
+    this.messageIds = [];
+    this.segments = [];
+    this.finalizedLength = 0;
+    this.lastContent = "";
+    this.lastUpdateTime = 0;
+  }
+
+  private isContinuation(prev: string, next: string): boolean {
+    if (!prev) return true;
+    if (next.startsWith(prev)) return true;
+    if (prev.startsWith(next)) return true;
+    if (prev.length >= 16) {
+      if (prev.length > next.length * 0.3) {
+        const idx = next.indexOf(prev);
+        if (idx >= 0 && idx <= 32) return true;
+      }
+    }
+    return false;
+  }
+
+  private computeFinalizedLength(segments: string[]): number {
+    if (segments.length <= 1) return 0;
+    let total = 0;
+    for (let i = 0; i < segments.length - 1; i++) {
+      total += segments[i]?.length ?? 0;
+    }
+    return total;
+  }
+
+  private buildSegments(content: string): string[] | null {
+    if (!content) return [];
+    if (!this.segments.length) {
+      return this.splitStreamingText(content, 0);
+    }
+
+    const baseLength = this.finalizedLength;
+    const remaining = content.slice(baseLength);
+    const currentSegment = this.segments[this.segments.length - 1] ?? "";
+
+    if (currentSegment && !remaining.startsWith(currentSegment)) {
+      return null;
+    }
+
+    const chunks = this.splitStreamingText(remaining, currentSegment.length);
+    return [...this.segments.slice(0, -1), ...chunks];
+  }
+
+  private splitStreamingText(text: string, minFirstChunk: number): string[] {
+    const limit = this.opts.textChunkLimit;
+    if (!text) return [];
+    if (limit <= 0 || text.length <= limit) {
+      return this.normalizeChunks([text], limit);
+    }
+
+    const chunks: string[] = [];
+    let remaining = text;
+    let min = Math.min(Math.max(minFirstChunk, 0), limit);
+    let first = true;
+
+    while (remaining.length > limit) {
+      const breakIdx = this.pickBreakIndex(remaining, limit, first ? min : 0);
+      const idx = Math.max(1, Math.min(breakIdx, remaining.length));
+      const chunk = remaining.slice(0, idx);
+      chunks.push(chunk);
+      remaining = remaining.slice(idx);
+      first = false;
+      min = 0;
+    }
+
+    if (remaining.length) {
+      chunks.push(remaining);
+    }
+    return this.normalizeChunks(chunks, limit);
+  }
+
+  private normalizeChunks(chunks: string[], limit: number): string[] {
+    if (!chunks.length) return chunks;
+    const out: string[] = [];
+    for (let i = 0; i < chunks.length; i++) {
+      const chunk = chunks[i] ?? "";
+      if (!chunk) continue;
+      if (!chunk.trim()) {
+        if (out.length && (limit <= 0 || out[out.length - 1].length + chunk.length <= limit)) {
+          out[out.length - 1] += chunk;
+          continue;
+        }
+        const next = chunks[i + 1];
+        if (next && (limit <= 0 || next.length + chunk.length <= limit)) {
+          chunks[i + 1] = chunk + next;
+          continue;
+        }
+        continue;
+      }
+      out.push(chunk);
+    }
+    return out;
+  }
+
+  private pickBreakIndex(text: string, limit: number, minIndex: number): number {
+    const boundedMin = Math.min(Math.max(minIndex, 0), limit);
+    const window = text.slice(0, limit);
+
+    if (this.opts.chunkMode === "newline") {
+      const paragraphRe = /\n[\t ]*\n+/g;
+      let match: RegExpExecArray | null;
+      let lastBreak = -1;
+      while ((match = paragraphRe.exec(window))) {
+        const idx = match.index + match[0].length;
+        if (idx >= boundedMin) {
+          lastBreak = idx;
+        }
+      }
+      if (lastBreak >= boundedMin) {
+        return lastBreak;
+      }
+    }
+
+    for (let i = window.length - 1; i >= boundedMin; i--) {
+      if (/\s/.test(window[i] ?? "")) {
+        return i + 1;
+      }
+    }
+
+    return Math.max(boundedMin, Math.min(limit, window.length));
+  }
+
+  private async syncSegments(nextSegments: string[], isFinal: boolean): Promise<void> {
+    const prevCount = this.messageIds.length;
+    const nextCount = nextSegments.length;
+
+    if (prevCount === 0) {
+      await this.sendInitialSegments(nextSegments, isFinal);
+      return;
+    }
+
+    if (nextCount < prevCount) {
+      await this.finalizeActiveMessage();
+      this.resetState();
+      await this.sendInitialSegments(nextSegments, isFinal);
+      return;
+    }
+
+    if (nextCount > prevCount) {
+      await this.updateExistingSegment(prevCount - 1, nextSegments[prevCount - 1] ?? "", false);
+      for (let i = prevCount; i < nextCount; i++) {
+        const streaming = !isFinal && i === nextCount - 1;
+        const id = await this.sendSegment(nextSegments[i] ?? "", streaming);
+        if (id) {
+          this.messageIds.push(id);
+          if (streaming) {
+            this.lastUpdateTime = Date.now();
+          }
+        }
+      }
+      return;
+    }
+
+    const streaming = !isFinal;
+    await this.updateExistingSegment(prevCount - 1, nextSegments[nextCount - 1] ?? "", streaming);
+    if (streaming) {
+      this.lastUpdateTime = Date.now();
+    }
+  }
+
+  private async sendInitialSegments(segments: string[], isFinal: boolean): Promise<void> {
+    for (let i = 0; i < segments.length; i++) {
+      const streaming = !isFinal && i === segments.length - 1;
+      const id = await this.sendSegment(segments[i] ?? "", streaming);
+      if (!id) {
+        return;
+      }
+      this.messageIds.push(id);
+      if (streaming) {
+        this.lastUpdateTime = Date.now();
+      }
+    }
+  }
+
+  private async sendSegment(content: string, streaming: boolean): Promise<string | null> {
+    if (!content.trim()) {
+      return null;
+    }
+    try {
+      const card = createSimpleTextCard(content, streaming);
+      const result = await sendCardFeishu({
+        cfg: this.ctx.cfg,
+        to: this.ctx.chatId,
+        card,
+        replyToMessageId: this.ctx.replyToMessageId,
+      });
+      return result.messageId;
+    } catch (err) {
+      this.ctx.runtime.error?.(`feishu stream card create failed: ${String(err)}`);
+      return null;
+    }
+  }
+
+  private async updateExistingSegment(
+    index: number,
+    content: string,
+    streaming: boolean,
+  ): Promise<void> {
+    const messageId = this.messageIds[index];
+    if (!messageId) return;
+    try {
+      const card = createSimpleTextCard(content, streaming);
       await updateCardFeishu({
         cfg: this.ctx.cfg,
-        messageId: this.messageId,
+        messageId,
         card,
       });
-      this.lastContent = content;
-      this.lastUpdateTime = Date.now();
     } catch (err) {
       this.ctx.runtime.log?.(`feishu stream update failed: ${String(err)}`);
     }
   }
 
-  async finalize(content: string) {
-    if (this.isFinalized) return;
-
-    // Wait for initialization if still in progress
-    if (this.initializationPromise) {
-      await this.initializationPromise;
-    }
-
-    if (this.pendingUpdate) {
-      clearTimeout(this.pendingUpdate);
-      this.pendingUpdate = null;
-    }
-
-    // Choose the longest content from all available sources
-    const finalContent = [content, this.pendingContent, this.lastContent].reduce(
-      (best, current) => {
-        if (!current) return best;
-        if (!best) return current;
-        return current.length >= best.length ? current : best;
-      },
-      "",
-    );
-    this.pendingContent = null;
-
-    // Use streaming_mode: false to signal completion
-    if (this.messageId && finalContent) {
-      try {
-        const card = createSimpleTextCard(finalContent, false /* streaming=false means done */);
-        await updateCardFeishu({
-          cfg: this.ctx.cfg,
-          messageId: this.messageId,
-          card,
-        });
-        this.isFinalized = true;
-        this.ctx.runtime.log?.(`feishu stream: finalized with ${finalContent.length} chars`);
-      } catch (err) {
-        this.ctx.runtime.error?.(`feishu stream finalize failed: ${String(err)}`);
-      }
-    }
-  }
-
-  getMessageId(): string | null {
-    return this.messageId;
+  private async finalizeActiveMessage(): Promise<void> {
+    if (!this.messageIds.length || !this.segments.length) return;
+    const index = this.messageIds.length - 1;
+    const content = this.segments[this.segments.length - 1] ?? "";
+    await this.updateExistingSegment(index, content, false);
   }
 }
 
@@ -207,8 +406,8 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
 
   // Track active stream for the current block
   let currentStream: FeishuStream | null = null;
-  // Prevent duplicate delivery (deliver may be called multiple times)
-  let hasDelivered = false;
+  // Prevent duplicate delivery of identical payloads
+  const deliveredKeys = new Set<string>();
 
   const typingCallbacks = createTypingCallbacks({
     start: async () => {
@@ -269,19 +468,23 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
           return;
         }
 
-        // Prevent duplicate delivery
-        if (hasDelivered) {
-          params.runtime.log?.(`feishu deliver: already delivered, skipping`);
-          return;
-        }
-        hasDelivered = true;
-
         // If we have an active stream, finalize it with the content
         if (currentStream) {
           await currentStream.finalize(text);
           currentStream = null;
           return;
         }
+
+        // Prevent duplicate delivery of identical payloads
+        if (deliveredKeys.has(text)) {
+          params.runtime.log?.(`feishu deliver: duplicate payload, skipping`);
+          return;
+        }
+        if (deliveredKeys.size >= DELIVERED_KEYS_MAX) {
+          const oldest = deliveredKeys.values().next().value as string | undefined;
+          if (oldest) deliveredKeys.delete(oldest);
+        }
+        deliveredKeys.add(text);
 
         // Check render mode: auto (default), raw, or card
         const feishuCfg = cfg.channels?.feishu as FeishuConfig | undefined;
@@ -335,12 +538,18 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
         if (!text) return;
 
         if (!currentStream) {
-          currentStream = new FeishuStream({
-            cfg,
-            chatId,
-            replyToMessageId,
-            runtime: params.runtime,
-          });
+          currentStream = new FeishuStream(
+            {
+              cfg,
+              chatId,
+              replyToMessageId,
+              runtime: params.runtime,
+            },
+            {
+              textChunkLimit,
+              chunkMode,
+            },
+          );
           // Stop typing indicator if we start streaming text
           if (typingState) {
             await typingCallbacks.onIdle?.();
