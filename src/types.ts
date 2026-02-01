@@ -45,6 +45,7 @@ export type FeishuProbeResult = {
 
 export type FeishuMediaInfo = {
   path: string;
+  url?: string;  // 添加 URL 字段，用于模型访问
   contentType?: string;
   placeholder: string;
 };
